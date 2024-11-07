@@ -1,0 +1,189 @@
+import random
+import re
+import json
+import os
+import sys
+import time
+import logging
+import argparse
+import pandas as pd
+
+"""
+基于脚本的多轮对话系统
+"""
+
+# 对话系统类
+class DialogSystem:
+    # 初始化对话系统
+    def __init__(self):
+        self.load_data()
+    # 加载数据
+    def load_data(self):
+        # 加载场景数据
+        self.node_id_to_node_info = {}
+        self.load_scenario(r"scenario\scenario-买衣服.json")
+
+        # 加载槽位模板数据
+        self.slot_info = {}
+        self.solt_template(r"scenario\slot_fitting_templet.xlsx")
+
+    # 加载场景数据
+    def load_scenario(self, scenario_file):
+        #把场景名称和node_id对应起来
+        scenario_name = os.path.basename(scenario_file).split(".")[0]
+        with open(scenario_file, "r", encoding="utf-8") as f:
+            self.scenario = json.load(f)
+        for node in self.scenario:
+            node_id = node["id"]
+            #给每个node_id加上场景名称作为前缀
+            node_id = scenario_name + "_" + node_id
+            #查看该场景下有没有子节点，如果有的话，把子节点的id也加上场景名称作为前缀
+            if "childnode" in node:
+                new_child = []
+                for child in node["childnode"]:
+                    new_child.append(scenario_name + "_" + child)
+                node["childnode"] = new_child
+            self.node_id_to_node_info[node_id] = node
+        print("场景数据加载完成")
+    # 加载槽位模板数据
+    def solt_template(self, template_file):
+        df = pd.read_excel(template_file)
+        for index, row in df.iterrows():
+            slot = row["slot"]
+            query = row["query"]
+            value = row["values"]
+            self.slot_info[slot] = [query, value]
+        print("槽位模板数据加载完成")
+        return
+
+
+    # 自然语言理解
+    def nlu(self, memory):
+        #意图识别
+        memory = self.get_intent(memory)
+        #槽值抽取
+        memory = self.get_slot(memory)
+        return memory
+    # 获得意图
+    def get_intent(self, memory):
+        #从所有当前节点中，找到最高分节点
+        max_score = -1
+        hit_intent = None
+
+        if self.get_node_score({"intent": "从选"}, memory) > 0.3:
+            # 重置当前节点的槽位
+            for slot in self.node_id_to_node_info[memory["hit_intent"]].get("slot", []):
+                memory.pop(slot, None)  # 移除槽位
+            memory["bot_response"] = "前面选项已经重置，请重新选购吧。"
+            return memory  # 直接返回重置后的 memory
+
+        for node_id in memory["available_node"]:
+            node = self.node_id_to_node_info[node_id]
+            score = self.get_node_score(node, memory)
+            if score > max_score:
+                max_score = score
+                hit_intent = node_id
+        memory["hit_intent"] = hit_intent
+        memory["hit_intent_score"] = max_score
+        return memory
+    # 计算节点分数
+    def get_node_score(self, node, memory):
+        # 计算单个节点分数
+        intent = memory["user_input"]
+        node_intents = node["intent"]
+        scores = []
+        for node_intent in node_intents:
+            sentence_similarity = self.get_sentence_similarity(intent, node_intent)
+            scores.append(sentence_similarity)
+        return max(scores)
+    # 计算句子相似度
+    def get_sentence_similarity(self, sentence1, sentence2):
+        # 计算两个句子相似度
+        # jaccard相似度计算
+        set1 = set(sentence1)
+        set2 = set(sentence2)
+        intersection = set1.intersection(set2)
+        union = set1.union(set2)
+        similarity = len(intersection) / len(union)
+        return similarity
+
+    # 获得槽值
+    def get_slot(self, memory):
+        hit_intent = memory["hit_intent"]
+        for slot in self.node_id_to_node_info[hit_intent].get("slot", []):
+            _, value = self.slot_info[slot]
+            if re.search(value, memory["user_input"]):
+                memory[slot] = re.search(value, memory["user_input"]).group()
+        return memory
+
+    # 对话状态追踪
+    def dst(self, memory):
+        #判断当前intent所需的槽位是否被填满
+        hit_intent = memory["hit_intent"]
+        slots = self.node_id_to_node_info[hit_intent].get("slot", [])
+        for slot in slots:
+            if slot not in memory:
+                memory["need_slot"] = slot
+                return memory
+        memory["need_slot"] = None
+        return memory
+
+    # 策略选择
+    def policy(self, memory):
+        #对话策略，根据当前状态选择合适的回复
+        #如果槽位有欠缺，则询问槽位值
+        #如果没有欠缺，则根据槽位值生成回复
+        if memory["need_slot"] is None:
+            memory["action"] = "answer"
+            #开放子节点
+            memory["available_node"] = self.node_id_to_node_info[memory["hit_intent"]].get("childnode", [])
+            #执行动作
+            #self.take_action(memory)
+        else:
+            memory["action"] = "ask"
+            #停留在当前节点
+            memory["available_node"] = [memory["hit_intent"]]
+        return memory
+
+    # 自然语言生成
+    def nlg(self, memory):
+        #文本生成模块
+        if memory["action"] == "answer":
+            answer = self.node_id_to_node_info[memory["hit_intent"]]["response"]
+            memory["bot_response"] = self.replace_slot(answer, memory)
+        else:
+            slot = memory["need_slot"]
+            query, _ = self.slot_info[slot]
+            memory["bot_response"] = query
+        return memory
+
+    # 替换槽位
+    def replace_slot(self, sentence, memory):
+        hit_intent = memory["hit_intent"]
+        slots = self.node_id_to_node_info[hit_intent].get("slot", [])
+        for slot in slots:
+            sentence = sentence.replace(slot, memory[slot])
+        return sentence
+
+    # 生成用户响应
+    def generate_response(self, user_input, memory):
+        memory["user_input"] = user_input
+        memory = self.nlu(memory)
+        memory = self.dst(memory)
+        memory = self.policy(memory)
+        memory = self.nlg(memory)
+        return memory["bot_response"], memory
+
+
+
+
+# 主程序入口
+if __name__ == '__main__':
+    ds = DialogSystem()
+    # print(ds.node_id_to_node_info)
+    # print(ds.slot_info)
+    memory = {"available_node": ["scenario-买衣服_node1"]}
+    while True:
+        user_input = input("请输入：")
+        response, memory = ds.generate_response(user_input, memory)
+        print("系统回复：", response)

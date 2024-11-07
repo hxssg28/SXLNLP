@@ -1,0 +1,7 @@
+[
+{
+"id":"node1",
+"intent":["重听"],
+"action":"REPEAT"
+}
+]
